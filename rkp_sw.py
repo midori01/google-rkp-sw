@@ -1,0 +1,832 @@
+#!/usr/bin/env python3
+#
+# Copyright 2025 mhmrdd <1@mhmrdd.me>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Software-side RKP (Remote Key Provisioning) without TEE involvement.
+
+Generates AuthenticatedRequest CSRs per generateCertificateRequestV2.cddl,
+communicates with Google's RKP server to obtain attestation certificates,
+and exports keybox.xml for Android key attestation.
+
+References:
+  - IETF RFC 9052 (COSE Structures)
+  - IETF RFC 9053 (COSE Algorithms)
+  - IETF RFC 9393 (Entity Attestation Token)
+  - Open DICE / Android DICE Chain spec
+  - Android RemoteProvisioning AIDL
+  - NIST SP 800-108 (KDF in Counter Mode)
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import configparser
+import os
+import struct
+import sys
+import textwrap
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
+
+import cbor2
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+from cryptography.hazmat.primitives.asymmetric.x25519 import (
+    X25519PrivateKey,
+    X25519PublicKey,
+)
+from cryptography.hazmat.primitives.ciphers import algorithms as cipher_algorithms
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.cmac import CMAC
+from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+    PublicFormat,
+)
+
+
+# ---------------------------------------------------------------------------
+# COSE / DICE Constants (RFC 9052, RFC 9053, Open DICE)
+# ---------------------------------------------------------------------------
+
+ALG_EDDSA = -8      # RFC 9053 Section 2.2
+ALG_ES256 = -7       # RFC 9053 Section 2.1
+ALG_A256GCM = 3      # RFC 9053 Section 4.1
+ALG_HMAC256 = 5      # RFC 9053 Section 3.1
+
+CWT_ISSUER = 1                # RFC 8392 Section 3
+CWT_SUBJECT = 2               # RFC 8392 Section 3
+DICE_SUBJECT_PUB_KEY = -4670552   # Open DICE profile
+DICE_KEY_USAGE = -4670553         # Open DICE profile
+
+RKP_SERVER_URL = 'https://remoteprovisioning.googleapis.com/v1'
+
+
+# ---------------------------------------------------------------------------
+# Hardware KDF — AES-128-CMAC Counter Mode (NIST SP 800-108)
+# ---------------------------------------------------------------------------
+
+class HardwareKdf:
+    """AES-128-CMAC counter-mode KDF for hardware-bound key derivation.
+
+    Implements the KDF observed in TEE ``CryptoHmacKdf(mode=1)`` calls:
+
+    * 16-byte output blocks (AES-128 block size).
+    * Counter mode: ``block_i = AES-CMAC(key, BE32(i) || label)``.
+    * Blocks are independently computed (no feedback chaining).
+
+    On real hardware the AES key is derived via a SoC-internal key ladder
+    and never enters software-accessible memory.  This class accepts the
+    key directly for simulation / research purposes.
+
+    See Also:
+        NIST SP 800-108r1 Section 4.1 — KDF in Counter Mode.
+    """
+
+    def __init__(self, aes_key: bytes) -> None:
+        if len(aes_key) != 16:
+            raise ValueError(
+                f'AES key must be 16 bytes, got {len(aes_key)}'
+            )
+        self._key = aes_key
+
+    def _cmac_block(self, counter: int, label: bytes) -> bytes:
+        """Compute one 16-byte CMAC block."""
+        mac = CMAC(cipher_algorithms.AES(self._key))
+        mac.update(struct.pack('>I', counter) + label)
+        return mac.finalize()
+
+    def derive(self, label: bytes, length: int = 32) -> bytes:
+        """Derive *length* bytes of key material for *label*."""
+        if not label:
+            raise ValueError('Empty label not supported')
+        num_blocks = (length + 15) // 16
+        output = b''.join(
+            self._cmac_block(i, label) for i in range(1, num_blocks + 1)
+        )
+        return output[:length]
+
+
+# ---------------------------------------------------------------------------
+# Device Configuration
+# ---------------------------------------------------------------------------
+
+_DEFAULT_DEVICE_INFO: dict[str, object] = {
+    'brand': 'generic',
+    'fused': 1,
+    'model': 'default',
+    'device': 'default',
+    'product': 'default',
+    'vb_state': 'green',
+    'os_version': '13',
+    'manufacturer': 'generic',
+    'security_level': 'tee',
+    'boot_patch_level': 20250101,
+    'bootloader_state': 'locked',
+    'system_patch_level': 202501,
+    'vendor_patch_level': 20250101,
+}
+
+
+def load_device_config(path: str | None) -> dict[str, object]:
+    """Load device configuration from an INI-style ``.conf`` file.
+
+    Expected format (see ``template.conf``)::
+
+        [device]
+        brand = <OEM>
+        model = <model>
+        ...
+
+        [fingerprint]
+        value = <build fingerprint>
+    """
+    if not path:
+        return dict(_DEFAULT_DEVICE_INFO)
+
+    cfg = configparser.ConfigParser()
+    cfg.read(path)
+
+    info: dict[str, object] = {}
+    if cfg.has_section('device'):
+        # Load defaults first, then override from config
+        info = dict(_DEFAULT_DEVICE_INFO)
+        for key, raw in cfg.items('device'):
+            if key == 'vbmeta_digest':
+                info[key] = bytes.fromhex(raw)
+            elif key == 'fused':
+                info[key] = int(raw)
+            elif key.endswith('_patch_level'):
+                info[key] = int(raw)
+            else:
+                info[key] = raw
+    else:
+        info = dict(_DEFAULT_DEVICE_INFO)
+
+    return info
+
+
+def get_fingerprint(cfg_path: str | None) -> str:
+    """Read build fingerprint from config, or return a generic default."""
+    if cfg_path:
+        cfg = configparser.ConfigParser()
+        cfg.read(cfg_path)
+        fp = cfg.get('fingerprint', 'value', fallback=None)
+        if fp:
+            return fp
+    return 'generic/default/default:13/TP1A.220624.014/0:user/release-keys'
+
+
+# ---------------------------------------------------------------------------
+# Seed Resolution
+# ---------------------------------------------------------------------------
+
+def resolve_seed(
+    *,
+    seed_hex: str | None = None,
+    hw_key_hex: str | None = None,
+) -> bytes:
+    """Resolve the 32-byte Ed25519 CDI_Leaf seed.
+
+    Priority:
+      1. ``--seed`` (direct 32-byte hex seed)
+      2. ``--hw-key`` (simulate hardware KDF to derive seed)
+      3. Fail with an error asking the user to provide one.
+    """
+    if seed_hex:
+        seed = bytes.fromhex(seed_hex)
+        if len(seed) != 32:
+            raise ValueError(f'Seed must be 32 bytes, got {len(seed)}')
+        return seed
+
+    if hw_key_hex:
+        key = bytes.fromhex(hw_key_hex)
+        return HardwareKdf(key).derive(b'rkp_bcc_km', 32)
+
+    print(
+        'Error: No key material provided.\n'
+        'Supply either --seed <64-hex-chars> or --hw-key <32-hex-chars>.',
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Key Management
+# ---------------------------------------------------------------------------
+
+class DeviceKeys:
+    """Ed25519 UDS / CDI_Leaf key pair (Degenerate DICE chain)."""
+
+    def __init__(self, seed: bytes) -> None:
+        self.seed = seed
+        self._privkey = Ed25519PrivateKey.from_private_bytes(seed)
+        self._pubkey = self._privkey.public_key()
+        self.pub_raw: bytes = self._pubkey.public_bytes(
+            Encoding.Raw, PublicFormat.Raw
+        )
+
+    def sign(self, data: bytes) -> bytes:
+        return self._privkey.sign(data)
+
+    def cose_key(self) -> dict:
+        """COSE_Key map per RFC 9052 Section 7."""
+        return {1: 1, 3: ALG_EDDSA, -1: 6, -2: self.pub_raw}
+
+
+# ---------------------------------------------------------------------------
+# COSE Primitives (RFC 9052)
+# ---------------------------------------------------------------------------
+
+def cose_sign1(
+    sign_fn,
+    protected: dict,
+    payload: bytes,
+) -> list:
+    """Build a COSE_Sign1 structure (RFC 9052 Section 4.2)."""
+    prot_bytes = cbor2.dumps(protected)
+    sig_input = cbor2.dumps(['Signature1', prot_bytes, b'', payload])
+    return [prot_bytes, {}, payload, sign_fn(sig_input)]
+
+
+def cose_encrypt0_build(
+    key: bytes,
+    nonce: bytes,
+    plaintext: bytes,
+    protected: dict,
+) -> cbor2.CBORTag:
+    """Build a COSE_Encrypt0 structure (RFC 9052 Section 5.2)."""
+    prot_bytes = cbor2.dumps(protected)
+    aad = cbor2.dumps(['Encrypt', prot_bytes, b''])
+    ct = AESGCM(key).encrypt(nonce, plaintext, aad)
+    return cbor2.CBORTag(96, [prot_bytes, {5: nonce}, ct])
+
+
+# ---------------------------------------------------------------------------
+# DICE Chain (Open DICE / Android BCC)
+# ---------------------------------------------------------------------------
+
+def build_dice_entry(keys: DeviceKeys, device_info: dict) -> list:
+    payload = cbor2.dumps({
+        CWT_ISSUER: device_info.get('dice_issuer', 'Android'),
+        CWT_SUBJECT: device_info.get('dice_subject', 'KeyMint'),
+        DICE_SUBJECT_PUB_KEY: cbor2.dumps(keys.cose_key()),
+        DICE_KEY_USAGE: b'\x20',
+    })
+    return cose_sign1(keys.sign, {1: ALG_EDDSA}, payload)
+
+
+def build_dice_chain(keys: DeviceKeys, device_info: dict) -> list:
+    return [keys.cose_key(), build_dice_entry(keys, device_info)]
+
+
+# ---------------------------------------------------------------------------
+# ECDH + HKDF Key Derivation (RFC 9053 Section 6)
+# ---------------------------------------------------------------------------
+
+def ecdh_derive_key(
+    eph_priv: X25519PrivateKey,
+    server_pub_bytes: bytes,
+    client_pub_bytes: bytes,
+) -> bytes:
+    """ECDH-ES + HKDF-SHA-256 → 32-byte AES-256 CEK."""
+    shared = eph_priv.exchange(
+        X25519PublicKey.from_public_bytes(server_pub_bytes)
+    )
+    ctx = cbor2.dumps([
+        ALG_A256GCM,
+        ['client', b'', client_pub_bytes],
+        ['server', b'', server_pub_bytes],
+        [256, b''],
+    ])
+    return HKDFExpand(hashes.SHA256(), 32, ctx).derive(shared)
+
+
+# ---------------------------------------------------------------------------
+# EC Key Generation
+# ---------------------------------------------------------------------------
+
+def generate_ec_keypair():
+    priv = ec.generate_private_key(ec.SECP256R1())
+    pub = priv.public_key()
+    nums = pub.public_numbers()
+    cose_pub = {
+        1: 2, 3: ALG_ES256, -1: 1,
+        -2: nums.x.to_bytes(32, 'big'),
+        -3: nums.y.to_bytes(32, 'big'),
+    }
+    return priv, cose_pub
+
+
+# ---------------------------------------------------------------------------
+# ProtectedData (COSE_Encrypt0)
+# ---------------------------------------------------------------------------
+
+def build_protected_data(
+    keys: DeviceKeys,
+    keys_to_sign: list,
+    eek_pub_bytes: bytes,
+    device_info: dict,
+    eek_curve: int = 2,
+):
+    dice = build_dice_chain(keys, device_info)
+    kt_cbor = cbor2.dumps(keys_to_sign)
+    mac_prot = cbor2.dumps({1: ALG_EDDSA})
+    mac_input = cbor2.dumps(['MAC0', mac_prot, b'', kt_cbor])
+    signed_mac = [mac_prot, {}, kt_cbor, keys.sign(mac_input)]
+    plaintext = cbor2.dumps([signed_mac, dice])
+
+    eph_priv = X25519PrivateKey.generate()
+    eph_pub = eph_priv.public_key().public_bytes(
+        Encoding.Raw, PublicFormat.Raw
+    )
+    aes_key = ecdh_derive_key(eph_priv, eek_pub_bytes, eph_pub)
+    nonce = os.urandom(12)
+
+    encrypted = cose_encrypt0_build(
+        aes_key, nonce, plaintext, {1: ALG_A256GCM}
+    )
+    return encrypted, eph_pub, dice
+
+
+# ---------------------------------------------------------------------------
+# CSR / AuthenticatedRequest
+# ---------------------------------------------------------------------------
+
+def build_csr(
+    keys: DeviceKeys,
+    challenge: bytes,
+    keys_to_sign: list,
+    eek_pub_bytes: bytes,
+    device_info: dict,
+    eek_curve: int = 2,
+) -> bytes:
+    """Build an AuthenticatedRequest per generateCertificateRequestV2.cddl."""
+    csr_payload = cbor2.dumps([3, 'keymint', device_info, keys_to_sign])
+    protected_data, _, dice = build_protected_data(
+        keys, keys_to_sign, eek_pub_bytes, device_info, eek_curve
+    )
+    signed_payload = cbor2.dumps([challenge, csr_payload])
+    signed_data = cose_sign1(keys.sign, {1: ALG_EDDSA}, signed_payload)
+    return cbor2.dumps([1, {}, dice, signed_data])
+
+
+# ---------------------------------------------------------------------------
+# RKP Server Communication
+# ---------------------------------------------------------------------------
+
+def fetch_eek(
+    fingerprint: str,
+    server_url: str = RKP_SERVER_URL,
+) -> tuple:
+    """Fetch EEK chain and challenge from Google RKP server."""
+    url = f'{server_url}:fetchEekChain'
+    prov_info = cbor2.dumps({'fingerprint': fingerprint, 'id': 42})
+
+    print(f'  Fetching EEK from {url}...')
+    req = urllib.request.Request(url, data=prov_info, method='POST')
+    req.add_header('Content-Type', 'application/cbor')
+
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = resp.read()
+    result = cbor2.loads(data)
+
+    eek_chains = result[0]
+    challenge = result[1]
+    config = result[2] if len(result) > 2 else {}
+
+    print(f'  Challenge: {challenge.hex()[:20]}... ({len(challenge)}B)')
+    print(f'  EEK chains: {len(eek_chains)} curves')
+    if config:
+        print(f'  Config: {config}')
+
+    eek_pub = None
+    eek_curve = None
+    for chain_entry in eek_chains:
+        curve = chain_entry[0]
+        chain = chain_entry[1]
+        last_cert = chain[-1]
+        if isinstance(last_cert, list) and len(last_cert) >= 3:
+            payload = cbor2.loads(last_cert[2])
+            pub_bytes = payload.get(-2)
+            crv = payload.get(-1)
+            if pub_bytes and curve == 2 and crv == 4:
+                eek_pub = pub_bytes
+                eek_curve = curve
+
+    if not eek_pub:
+        for chain_entry in eek_chains:
+            curve = chain_entry[0]
+            chain = chain_entry[1]
+            last_cert = chain[-1]
+            if isinstance(last_cert, list) and len(last_cert) >= 3:
+                payload = cbor2.loads(last_cert[2])
+                pub_bytes = payload.get(-2)
+                if pub_bytes and curve == 1:
+                    eek_pub = pub_bytes
+                    eek_curve = curve
+
+    return challenge, eek_pub, eek_curve, eek_chains
+
+
+def submit_csr(
+    csr_bytes: bytes,
+    challenge: bytes,
+    server_url: str = RKP_SERVER_URL,
+) -> list[bytes]:
+    """Submit CSR to Google RKP server and return certificate chains."""
+    challenge_b64 = base64.urlsafe_b64encode(challenge).decode().rstrip('=')
+    url = f'{server_url}:signCertificates?challenge={challenge_b64}'
+
+    print(f'  Submitting CSR to server...')
+    req = urllib.request.Request(url, data=csr_bytes, method='POST')
+    req.add_header('Content-Type', 'application/cbor')
+
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = resp.read()
+
+    result = cbor2.loads(data)
+    print(f'  Response: {len(data)} bytes')
+
+    if isinstance(result, list):
+        certs = result[0] if isinstance(result[0], list) else result
+        if isinstance(certs, list) and len(certs) >= 2:
+            shared_chain = certs[0] if isinstance(certs[0], bytes) else b''
+            unique_chains = certs[1] if isinstance(certs[1], list) else []
+            all_chains = []
+            for uc in unique_chains:
+                if isinstance(uc, bytes):
+                    all_chains.append(shared_chain + uc)
+            print(f'  Received {len(all_chains)} certificate chain(s)')
+            return all_chains
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Keybox XML Export
+# ---------------------------------------------------------------------------
+
+def _pem_string(obj, encoding=Encoding.PEM, fmt=None) -> str:
+    """Serialize a key or certificate to PEM text."""
+    if isinstance(obj, x509.Certificate):
+        return obj.public_bytes(Encoding.PEM).decode()
+    if fmt is not None:
+        return obj.private_bytes(Encoding.PEM, fmt, NoEncryption()).decode()
+    return obj.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo).decode()
+
+
+def build_keybox_xml(
+    *,
+    ec_privkey,
+    ec_cert_chain: list[x509.Certificate],
+    device_id: str = 'generic-000000',
+) -> str:
+    """Build keybox.xml for Android key attestation.
+
+    Args:
+        ec_privkey: EC private key (P-256).
+        ec_cert_chain: List of X.509 certificates (leaf first, root last).
+        device_id: Device identifier string.
+
+    Returns:
+        Pretty-printed XML string.
+    """
+    root = ET.Element('AndroidAttestation')
+
+    ET.SubElement(root, 'NumberOfKeyboxes').text = '1'
+
+    keybox = ET.SubElement(root, 'Keybox', DeviceID=device_id)
+
+    ec_key_elem = ET.SubElement(keybox, 'Key', algorithm='ecdsa')
+    pk_elem = ET.SubElement(ec_key_elem, 'PrivateKey', format='pem')
+    pk_elem.text = '\n' + _pem_string(
+        ec_privkey, fmt=PrivateFormat.TraditionalOpenSSL
+    )
+
+    chain_elem = ET.SubElement(ec_key_elem, 'CertificateChain')
+    ET.SubElement(chain_elem, 'NumberOfCertificates').text = str(
+        len(ec_cert_chain)
+    )
+    for cert in ec_cert_chain:
+        cert_elem = ET.SubElement(chain_elem, 'Certificate', format='pem')
+        cert_elem.text = '\n' + _pem_string(cert)
+
+    rough = ET.tostring(root, encoding='unicode', xml_declaration=False)
+    dom = minidom.parseString(rough)
+    pretty = dom.toprettyxml(indent='    ')
+    # Remove minidom's default xml declaration (we add our own)
+    lines = pretty.split('\n')
+    if lines[0].startswith('<?xml'):
+        lines = lines[1:]
+    return '<?xml version="1.0"?>\n' + '\n'.join(lines)
+
+
+def parse_der_cert_chain(data: bytes) -> list[x509.Certificate]:
+    """Parse concatenated DER certificates.
+
+    Manually reads DER SEQUENCE headers to split certs, since
+    ``load_der_x509_certificate`` rejects trailing data.
+    """
+    certs = []
+    pos = 0
+    while pos < len(data) and data[pos] == 0x30:
+        # Parse DER SEQUENCE length
+        if data[pos + 1] & 0x80:
+            num_len_bytes = data[pos + 1] & 0x7F
+            length = int.from_bytes(
+                data[pos + 2 : pos + 2 + num_len_bytes], 'big'
+            )
+            header_len = 2 + num_len_bytes
+        else:
+            length = data[pos + 1]
+            header_len = 2
+        cert_len = header_len + length
+        try:
+            cert = x509.load_der_x509_certificate(data[pos : pos + cert_len])
+            certs.append(cert)
+        except Exception:
+            break
+        pos += cert_len
+    return certs
+
+
+# ---------------------------------------------------------------------------
+# CLI Commands
+# ---------------------------------------------------------------------------
+
+def cmd_provision(args: argparse.Namespace) -> None:
+    """Full provisioning: generate keys, fetch EEK, submit CSR, get certs."""
+    seed = resolve_seed(
+        seed_hex=args.seed, hw_key_hex=args.hw_key
+    )
+    keys = DeviceKeys(seed)
+    device_info = load_device_config(args.config)
+    fingerprint = get_fingerprint(args.config)
+
+    mode = 'hw-kdf' if args.hw_key else 'direct-seed'
+    print(f'Mode:            {mode}')
+    print(f'CDI_Leaf pubkey: {keys.pub_raw.hex()}')
+
+    num_keys = args.num_keys
+    print(f'\n[1] Generating {num_keys} EC P-256 keypair(s)...')
+    ec_keys = []
+    cose_pubs = []
+    for i in range(num_keys):
+        priv, pub = generate_ec_keypair()
+        ec_keys.append(priv)
+        cose_pubs.append(pub)
+        print(f'  Key {i}: P-256')
+
+    url = args.server_url or RKP_SERVER_URL
+    print(f'\n[2] Fetching EEK from RKP server...')
+    try:
+        challenge, eek_pub, eek_curve, _ = fetch_eek(fingerprint, url)
+    except Exception as e:
+        print(f'  Failed: {e}')
+        print('  Falling back to local test mode...')
+        challenge = os.urandom(32)
+        eek_priv = X25519PrivateKey.generate()
+        eek_pub = eek_priv.public_key().public_bytes(
+            Encoding.Raw, PublicFormat.Raw
+        )
+        eek_curve = 2
+
+    print(f'\n[3] Building CSR...')
+    csr_bytes = build_csr(
+        keys, challenge, cose_pubs, eek_pub, device_info, eek_curve
+    )
+    print(f'  CSR: {len(csr_bytes)} bytes')
+
+    csr = cbor2.loads(csr_bytes)
+    sd = csr[3]
+    sig_struct = cbor2.dumps(['Signature1', sd[0], b'', sd[2]])
+    Ed25519PublicKey.from_public_bytes(keys.pub_raw).verify(sd[3], sig_struct)
+    print(f'  Signature verification: OK')
+
+    print(f'\n[4] Submitting CSR...')
+    try:
+        cert_chains = submit_csr(csr_bytes, challenge, url)
+        for i, chain_der in enumerate(cert_chains):
+            fname = f'cert_chain_{i}.der'
+            with open(fname, 'wb') as f:
+                f.write(chain_der)
+            certs = parse_der_cert_chain(chain_der)
+            print(f'  Chain {i}: {len(certs)} certs, saved to {fname}')
+            for j, c in enumerate(certs):
+                print(f'    [{j}] {c.subject}')
+
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:300]
+        print(f'  HTTP {e.code}: {body}')
+        with open('csr_output.cbor', 'wb') as f:
+            f.write(csr_bytes)
+        print(f'  CSR saved to csr_output.cbor')
+
+
+def cmd_keybox(args: argparse.Namespace) -> None:
+    """Export attestation keys and certs as keybox.xml."""
+    seed = resolve_seed(
+        seed_hex=args.seed, hw_key_hex=args.hw_key
+    )
+    keys = DeviceKeys(seed)
+    device_info = load_device_config(args.config)
+    fingerprint = get_fingerprint(args.config)
+
+    print(f'CDI_Leaf pubkey: {keys.pub_raw.hex()}')
+
+    url = args.server_url or RKP_SERVER_URL
+
+    # Generate EC key and provision
+    ec_priv, ec_cose_pub = generate_ec_keypair()
+
+    print('Fetching EEK...')
+    try:
+        challenge, eek_pub, eek_curve, _ = fetch_eek(fingerprint, url)
+    except Exception as e:
+        print(f'Error fetching EEK: {e}', file=sys.stderr)
+        sys.exit(1)
+
+    print('Building and submitting EC CSR...')
+    csr_bytes = build_csr(
+        keys, challenge, [ec_cose_pub], eek_pub, device_info, eek_curve
+    )
+    try:
+        ec_chains = submit_csr(csr_bytes, challenge, url)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:300]
+        print(f'Server error: HTTP {e.code}: {body}', file=sys.stderr)
+        sys.exit(1)
+
+    if not ec_chains:
+        print('Error: No certificate chains received.', file=sys.stderr)
+        sys.exit(1)
+
+    ec_certs = parse_der_cert_chain(ec_chains[0])
+    print(f'EC chain: {len(ec_certs)} certificates')
+
+    manufacturer = device_info.get('manufacturer', 'generic')
+    device_id = f'{manufacturer}-{os.urandom(6).hex()}'
+
+    xml_str = build_keybox_xml(
+        ec_privkey=ec_priv,
+        ec_cert_chain=ec_certs,
+        device_id=device_id,
+    )
+
+    outfile = args.output or 'keybox.xml'
+    with open(outfile, 'w') as f:
+        f.write(xml_str)
+    print(f'Keybox written to {outfile}')
+
+
+def cmd_info(args: argparse.Namespace) -> None:
+    """Show key and device information."""
+    seed = resolve_seed(
+        seed_hex=args.seed, hw_key_hex=args.hw_key
+    )
+    keys = DeviceKeys(seed)
+    device_info = load_device_config(args.config)
+
+    print(f'Ed25519 seed:   {keys.seed.hex()}')
+    print(f'Ed25519 pubkey: {keys.pub_raw.hex()}')
+    print(f'Device:         {device_info.get("brand")} '
+          f'{device_info.get("model")} ({device_info.get("device")})')
+    print(f'Fused:          {device_info.get("fused")}')
+    print(f'VB state:       {device_info.get("vb_state")}')
+    print(f'Bootloader:     {device_info.get("bootloader_state")}')
+    print(f'Patches:        boot={device_info.get("boot_patch_level")} '
+          f'system={device_info.get("system_patch_level")} '
+          f'vendor={device_info.get("vendor_patch_level")}')
+
+    if args.hw_key:
+        print(f'\nHardware KDF simulation:')
+        kdf = HardwareKdf(bytes.fromhex(args.hw_key))
+        for label in [b'rkp_bcc_km', b'keymaster1']:
+            out = kdf.derive(label, 32)
+            print(f'  KDF("{label.decode()}"): {out.hex()}')
+
+
+def cmd_verify(args: argparse.Namespace) -> None:
+    """Verify a CSR file."""
+    with open(args.csr_file, 'rb') as f:
+        csr_bytes = f.read()
+
+    csr = cbor2.loads(csr_bytes)
+    print(f'Version:        {csr[0]}')
+    print(f'DiceCertChain:  {len(csr[2])} entries')
+
+    uds_pub = csr[2][0][-2]
+    print(f'UDS_Pub:        {uds_pub.hex()}')
+
+    sd = csr[3]
+    sig_struct = cbor2.dumps(['Signature1', sd[0], b'', sd[2]])
+    try:
+        Ed25519PublicKey.from_public_bytes(uds_pub).verify(sd[3], sig_struct)
+        print('Signature:      VALID')
+    except Exception as e:
+        print(f'Signature:      INVALID ({e})')
+
+    payload = cbor2.loads(sd[2])
+    csr_payload = cbor2.loads(payload[1])
+    print(f'CSR version:    {csr_payload[0]}')
+    print(f'CertType:       {csr_payload[1]}')
+    print(f'Brand:          {csr_payload[2].get("brand")}')
+    print(f'KeysToSign:     {len(csr_payload[3])} keys')
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def _add_key_args(parser: argparse.ArgumentParser) -> None:
+    """Add common key-material arguments to a subparser."""
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        '--seed', type=str, metavar='HEX',
+        help='Ed25519 CDI_Leaf seed (64 hex chars).',
+    )
+    group.add_argument(
+        '--hw-key', type=str, metavar='HEX',
+        help='16-byte hardware AES key (32 hex chars) for simulated KDF.',
+    )
+    parser.add_argument(
+        '--config', type=str, metavar='FILE',
+        help='Device configuration file (INI format). '
+             'See template.conf for format.',
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='Software RKP — Remote Key Provisioning without TEE.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            examples:
+              %(prog)s info --seed <hex> --config device_prop.conf
+              %(prog)s provision --seed <hex> --config device_prop.conf
+              %(prog)s provision --hw-key <hex> --config device_prop.conf
+              %(prog)s keybox --seed <hex> --config device_prop.conf -o keybox.xml
+              %(prog)s verify csr_output.cbor
+
+            See template.conf for device configuration format.
+        """),
+    )
+    sub = parser.add_subparsers(dest='command')
+
+    # info
+    p_info = sub.add_parser('info', help='Show key and device info')
+    _add_key_args(p_info)
+    p_info.set_defaults(func=cmd_info)
+
+    # provision
+    p_prov = sub.add_parser('provision', help='Full RKP provisioning flow')
+    _add_key_args(p_prov)
+    p_prov.add_argument('-n', '--num-keys', type=int, default=1)
+    p_prov.add_argument('-u', '--server-url', type=str)
+    p_prov.set_defaults(func=cmd_provision)
+
+    # keybox
+    p_kb = sub.add_parser('keybox', help='Export keybox.xml')
+    _add_key_args(p_kb)
+    p_kb.add_argument('-o', '--output', type=str, default='keybox.xml')
+    p_kb.add_argument('-u', '--server-url', type=str)
+    p_kb.set_defaults(func=cmd_keybox)
+
+    # verify
+    p_ver = sub.add_parser('verify', help='Verify a CSR file')
+    p_ver.add_argument('csr_file')
+    p_ver.set_defaults(func=cmd_verify)
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        return
+
+    args.func(args)
+
+
+if __name__ == '__main__':
+    main()

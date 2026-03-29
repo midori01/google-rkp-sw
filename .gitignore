@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Device-specific private config (contains credentials)
+device_prop.conf
+
+# Generated artifacts
+*.der
+*.cbor
+*.b64
+*.pem
+keybox.xml
+cert_chain_*
+csr_output*
+rkp_response*
