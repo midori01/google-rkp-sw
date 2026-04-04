@@ -51,6 +51,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
+from cryptography.hazmat.primitives.asymmetric.utils import (
+    decode_dss_signature,
+    encode_dss_signature,
+)
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
     X25519PublicKey,
@@ -246,22 +250,75 @@ def resolve_seed(
 # ---------------------------------------------------------------------------
 
 class DeviceKeys:
-    """Ed25519 UDS / CDI_Leaf key pair (Degenerate DICE chain)."""
+    """UDS / CDI_Leaf key pair (Degenerate DICE chain).
 
-    def __init__(self, seed: bytes) -> None:
+    Args:
+        seed: 32-byte CDI_Leaf seed.
+        curve: ``'ed25519'`` (default) or ``'p256'``.
+    """
+
+    # secp256r1 group order (NIST P-256)
+    _P256_ORDER = (
+        0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+    )
+
+    def __init__(self, seed: bytes, curve: str = 'ed25519') -> None:
         self.seed = seed
-        self._privkey = Ed25519PrivateKey.from_private_bytes(seed)
-        self._pubkey = self._privkey.public_key()
-        self.pub_raw: bytes = self._pubkey.public_bytes(
-            Encoding.Raw, PublicFormat.Raw
-        )
+        self.curve = curve
+        self._pub_x: bytes = b''
+        self._pub_y: bytes = b''
+
+        if curve == 'ed25519':
+            self._privkey = Ed25519PrivateKey.from_private_bytes(seed)
+            self._pubkey = self._privkey.public_key()
+            self.pub_raw: bytes = self._pubkey.public_bytes(
+                Encoding.Raw, PublicFormat.Raw
+            )
+            self.alg = ALG_EDDSA
+        elif curve == 'p256':
+            scalar = int.from_bytes(seed, 'big') % self._P256_ORDER
+            if scalar == 0:
+                scalar = 1
+            self._privkey = ec.derive_private_key(scalar, ec.SECP256R1())
+            self._pubkey = self._privkey.public_key()
+            nums = self._pubkey.public_numbers()
+            self._pub_x = nums.x.to_bytes(32, 'big')
+            self._pub_y = nums.y.to_bytes(32, 'big')
+            self.pub_raw = self._pub_x + self._pub_y
+            self.alg = ALG_ES256
+        else:
+            raise ValueError(f'Unsupported curve: {curve!r}')
 
     def sign(self, data: bytes) -> bytes:
-        return self._privkey.sign(data)
+        """Sign data and return raw signature bytes."""
+        if self.curve == 'ed25519':
+            return self._privkey.sign(data)
+        else:
+            sig_der = self._privkey.sign(data, ec.ECDSA(hashes.SHA256()))
+            r, s = decode_dss_signature(sig_der)
+            return r.to_bytes(32, 'big') + s.to_bytes(32, 'big')
+
+    def verify(self, signature: bytes, data: bytes) -> None:
+        """Verify a raw signature against data.  Raises on failure."""
+        if self.curve == 'ed25519':
+            self._pubkey.verify(signature, data)
+        else:
+            r = int.from_bytes(signature[:32], 'big')
+            s = int.from_bytes(signature[32:], 'big')
+            self._pubkey.verify(
+                encode_dss_signature(r, s), data,
+                ec.ECDSA(hashes.SHA256()),
+            )
 
     def cose_key(self) -> dict:
         """COSE_Key map per RFC 9052 Section 7."""
-        return {1: 1, 3: ALG_EDDSA, -1: 6, -2: self.pub_raw}
+        if self.curve == 'ed25519':
+            return {1: 1, 3: ALG_EDDSA, -1: 6, -2: self.pub_raw}
+        else:
+            return {
+                1: 2, 3: ALG_ES256, -1: 1,
+                -2: self._pub_x, -3: self._pub_y,
+            }
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +360,7 @@ def build_dice_entry(keys: DeviceKeys, device_info: dict) -> list:
         DICE_SUBJECT_PUB_KEY: cbor2.dumps(keys.cose_key()),
         DICE_KEY_USAGE: b'\x20',
     })
-    return cose_sign1(keys.sign, {1: ALG_EDDSA}, payload)
+    return cose_sign1(keys.sign, {1: keys.alg}, payload)
 
 
 def build_dice_chain(keys: DeviceKeys, device_info: dict) -> list:
@@ -361,7 +418,7 @@ def build_protected_data(
 ):
     dice = build_dice_chain(keys, device_info)
     kt_cbor = cbor2.dumps(keys_to_sign)
-    mac_prot = cbor2.dumps({1: ALG_EDDSA})
+    mac_prot = cbor2.dumps({1: keys.alg})
     mac_input = cbor2.dumps(['MAC0', mac_prot, b'', kt_cbor])
     signed_mac = [mac_prot, {}, kt_cbor, keys.sign(mac_input)]
     plaintext = cbor2.dumps([signed_mac, dice])
@@ -397,7 +454,7 @@ def build_csr(
         keys, keys_to_sign, eek_pub_bytes, device_info, eek_curve
     )
     signed_payload = cbor2.dumps([challenge, csr_payload])
-    signed_data = cose_sign1(keys.sign, {1: ALG_EDDSA}, signed_payload)
+    signed_data = cose_sign1(keys.sign, {1: keys.alg}, signed_payload)
     return cbor2.dumps([1, {}, dice, signed_data])
 
 
@@ -691,7 +748,8 @@ def cmd_provision(args: argparse.Namespace) -> None:
         seed_hex=args.seed, hw_key_hex=args.hw_key,
         kdf_label=getattr(args, 'kdf_label', None),
     )
-    keys = DeviceKeys(seed)
+    curve = args.curve
+    keys = DeviceKeys(seed, curve=curve)
     device_info = load_device_config(args.config)
     fingerprint = get_fingerprint(args.config)
 
@@ -732,7 +790,7 @@ def cmd_provision(args: argparse.Namespace) -> None:
     csr = cbor2.loads(csr_bytes)
     sd = csr[3]
     sig_struct = cbor2.dumps(['Signature1', sd[0], b'', sd[2]])
-    Ed25519PublicKey.from_public_bytes(keys.pub_raw).verify(sd[3], sig_struct)
+    keys.verify(sd[3], sig_struct)
     print(f'  Signature verification: OK')
 
     print(f'\n[4] Submitting CSR...')
@@ -772,7 +830,8 @@ def cmd_keybox(args: argparse.Namespace) -> None:
         seed_hex=args.seed, hw_key_hex=args.hw_key,
         kdf_label=getattr(args, 'kdf_label', None),
     )
-    keys = DeviceKeys(seed)
+    curve = args.curve
+    keys = DeviceKeys(seed, curve=curve)
     device_info = load_device_config(args.config)
     fingerprint = get_fingerprint(args.config)
 
@@ -828,11 +887,14 @@ def cmd_info(args: argparse.Namespace) -> None:
         seed_hex=args.seed, hw_key_hex=args.hw_key,
         kdf_label=getattr(args, 'kdf_label', None),
     )
-    keys = DeviceKeys(seed)
+    curve = args.curve
+    keys = DeviceKeys(seed, curve=curve)
     device_info = load_device_config(args.config)
 
-    print(f'Ed25519 seed:   {keys.seed.hex()}')
-    print(f'Ed25519 pubkey: {keys.pub_raw.hex()}')
+    curve_label = 'Ed25519' if curve == 'ed25519' else 'P-256'
+    print(f'Curve:          {curve_label}')
+    print(f'Seed:           {keys.seed.hex()}')
+    print(f'Public key:     {keys.pub_raw.hex()}')
     print(f'Device:         {device_info.get("brand")} '
           f'{device_info.get("model")} ({device_info.get("device")})')
     print(f'Fused:          {device_info.get("fused")}')
@@ -860,13 +922,35 @@ def cmd_verify(args: argparse.Namespace) -> None:
     print(f'Version:        {csr[0]}')
     print(f'DiceCertChain:  {len(csr[2])} entries')
 
-    uds_pub = csr[2][0][-2]
-    print(f'UDS_Pub:        {uds_pub.hex()}')
+    uds_cose = csr[2][0]
+    kty = uds_cose.get(1)
+    if kty == 1:  # OKP (Ed25519)
+        uds_pub = uds_cose[-2]
+        print(f'UDS_Pub (Ed25519): {uds_pub.hex()}')
+    elif kty == 2:  # EC2 (P-256)
+        uds_pub_x = uds_cose[-2]
+        uds_pub_y = uds_cose[-3]
+        print(f'UDS_Pub (P-256):   X={uds_pub_x.hex()}, Y={uds_pub_y.hex()}')
+    else:
+        print(f'UDS_Pub (unknown kty={kty})')
 
     sd = csr[3]
     sig_struct = cbor2.dumps(['Signature1', sd[0], b'', sd[2]])
     try:
-        Ed25519PublicKey.from_public_bytes(uds_pub).verify(sd[3], sig_struct)
+        if kty == 1:
+            Ed25519PublicKey.from_public_bytes(uds_pub).verify(sd[3], sig_struct)
+        elif kty == 2:
+            pub = ec.EllipticCurvePublicNumbers(
+                int.from_bytes(uds_pub_x, 'big'),
+                int.from_bytes(uds_pub_y, 'big'),
+                ec.SECP256R1(),
+            ).public_key()
+            r = int.from_bytes(sd[3][:32], 'big')
+            s = int.from_bytes(sd[3][32:], 'big')
+            pub.verify(
+                encode_dss_signature(r, s), sig_struct,
+                ec.ECDSA(hashes.SHA256()),
+            )
         print('Signature:      VALID')
     except Exception as e:
         print(f'Signature:      INVALID ({e})')
@@ -888,11 +972,15 @@ def _add_key_args(parser: argparse.ArgumentParser) -> None:
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         '--seed', type=str, metavar='HEX',
-        help='Ed25519 CDI_Leaf seed (64 hex chars).',
+        help='32-byte CDI_Leaf seed (64 hex chars).',
     )
     group.add_argument(
         '--hw-key', type=str, metavar='HEX',
         help='16-byte hardware AES key (32 hex chars) for simulated KDF.',
+    )
+    parser.add_argument(
+        '--curve', type=str, choices=['ed25519', 'p256'], default='ed25519',
+        help='DICE key curve: ed25519 (default) or p256.',
     )
     parser.add_argument(
         '--kdf-label', type=str, metavar='LABEL',
